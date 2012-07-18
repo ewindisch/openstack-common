@@ -29,6 +29,7 @@ from openstack.common import cfg
 from openstack.common.gettextutils import _
 from openstack.common import importutils
 from openstack.common import jsonutils
+from openstack.common import matchmaker
 from openstack.common.rpc import common as rpc_common
 
 
@@ -45,14 +46,6 @@ zmq_opts = [
                     'an ethernet interface, or IP. '
                     'The "host" option should point or resolve to this '
                     'address.'),
-
-    # The module.Class to use for matchmaking.
-    cfg.StrOpt(
-        'rpc_zmq_matchmaker',
-        default=('openstack.common.rpc.'
-                 'matchmaker.MatchMakerLocalhost'),
-        help='MatchMaker driver',
-        ),
 
     # The following port is unassigned by IANA as of 2012-05-21
     cfg.IntOpt('rpc_zmq_port', default=9501,
@@ -74,7 +67,6 @@ zmq_opts = [
 # a mandatory initialization call
 FLAGS = None
 ZMQ_CTX = None  # ZeroMQ Context, must be global.
-matchmaker = None  # memoized matchmaker object
 
 
 def _serialize(data):
@@ -705,21 +697,6 @@ def register_opts(conf):
     # Don't re-set, if this method is called twice.
     if not ZMQ_CTX:
         ZMQ_CTX = zmq.Context(conf.rpc_zmq_contexts)
-    if not matchmaker:
-        # rpc_zmq_matchmaker should be set to a 'module.Class'
-        mm_path = conf.rpc_zmq_matchmaker.split('.')
-        mm_module = '.'.join(mm_path[:-1])
-        mm_class = mm_path[-1]
-
-        # Only initialize a class.
-        if mm_path[-1][0] not in string.ascii_uppercase:
-            LOG.error(_("Matchmaker could not be loaded.\n"
-                      "rpc_zmq_matchmaker is not a class."))
-            raise RPCException(_("Error loading Matchmaker."))
-
-        mm_impl = importutils.import_module(mm_module)
-        mm_constructor = getattr(mm_impl, mm_class)
-        matchmaker = mm_constructor()
 
 
 register_opts(cfg.CONF)
