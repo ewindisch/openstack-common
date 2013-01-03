@@ -249,15 +249,16 @@ class InternalContext(object):
         self.proxy = proxy
         self.msg_waiter = None
 
-    def _get_response(self, ctx, proxy, topic, data):
+    @staticmethod
+    def _get_response(ctx, proxy, request):
         """Process a curried message and cast the result to topic."""
         LOG.debug(_("Running func with context: %s"), ctx.to_dict())
-        data.setdefault('version', None)
-        data.setdefault('args', {})
+        request.setdefault('version', None)
+        request.setdefault('args', {})
 
         try:
             result = proxy.dispatch(
-                ctx, data['version'], data['method'], **data['args'])
+                ctx, request['version'], request['method'], **request['args'])
             return ConsumerBase.normalize_reply(result, ctx.replies)
         except greenlet.GreenletExit:
             # ignore these since they are just from shutdowns
@@ -273,16 +274,8 @@ class InternalContext(object):
             return {'exc':
                     rpc_common.serialize_remote_exception(sys.exc_info())}
 
-    def reply(self, ctx, proxy,
-              msg_id=None, context=None, topic=None, msg=None):
+    def reply(self, ctx, msg_id, topic, request, response):
         """Reply to a casted call."""
-        # Our real method is curried into msg['args']
-
-        child_ctx = RpcContext.unmarshal(msg[0])
-        response = ConsumerBase.normalize_reply(
-            self._get_response(child_ctx, proxy, topic, msg[1]),
-            ctx.replies)
-
         LOG.debug(_("Sending reply"))
         cast(CONF, ctx, topic, {
             'method': '-process_reply',
@@ -309,24 +302,21 @@ class ConsumerBase(object):
         else:
             return [result]
 
-    def process(self, style, target, proxy, ctx, data):
+    def process(self, msg_id, topic, proxy, ctx, request):
         # Method starting with - are
         # processed internally. (non-valid method name)
-        method = data['method']
+        method = request['method']
 
         # Internal method
         # uses internal context for safety.
-        if data['method'][0] == '-':
-            # For reply / process_reply
-            method = method[1:]
-            if method == 'reply':
-                self.private_ctx.reply(ctx, proxy, **data['args'])
+        if method[0] == '-' and method[1:] == 'reply':
+            LOG.debug(request)
+            method = request['args']['method']
+            response = InternalContext._get_response(ctx, proxy, request)
+            self.private_ctx.reply(ctx, msg_id, topic, request, response)
             return
-
-        data.setdefault('version', None)
-        data.setdefault('args', {})
-        proxy.dispatch(ctx, data['version'],
-                       data['method'], **data['args'])
+        else:
+            response = InternalContext._get_response(ctx, proxy, request)
 
 
 class ZmqBaseReactor(ConsumerBase):
@@ -528,7 +518,7 @@ class ZmqReactor(ZmqBaseReactor):
 
         proxy = self.proxies[sock]
 
-        self.pool.spawn_n(self.process, style, topic,
+        self.pool.spawn_n(self.process, msg_id, topic,
                           proxy, ctx, request)
 
 
