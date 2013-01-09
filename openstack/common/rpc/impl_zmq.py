@@ -67,6 +67,10 @@ zmq_opts = [
                help='Maximum number of ingress messages to locally buffer '
                     'per topic. Default is unlimited.'),
 
+    cfg.IntOpt('rpc_zmq_max_concurrent_casts', default=1000,
+               help='Maximum simultaneously sending casts. '
+                    'Each cast consumes a greenthread.'),
+
     cfg.StrOpt('rpc_zmq_ipc_dir', default='/var/run/openstack',
                help='Directory for holding IPC sockets'),
 
@@ -81,6 +85,7 @@ CONF.register_opts(zmq_opts)
 
 ZMQ_CTX = None  # ZeroMQ Context, must be global.
 matchmaker = None  # memoized matchmaker object
+ZMQ_CAST_POOL = None  # GreenPool for casts
 
 
 def _serialize(data):
@@ -654,8 +659,8 @@ def _call(addr, context, msg_id, topic, msg, timeout=None,
             )
 
             LOG.debug(_("Sending cast"))
-            _cast(addr, context, msg_id, topic, payload,
-                  serialize=serialize, force_envelope=force_envelope)
+            _put_cast_buf([addr, context, msg_id, topic, payload,
+                serialize=serialize, force_envelope=force_envelope)
 
             LOG.debug(_("Cast sent; Waiting reply"))
             # Blocks until receives reply
@@ -707,9 +712,9 @@ def _multi_send(method, context, topic, msg, timeout=None, serialize=True,
         _addr = "tcp://%s:%s" % (ip_addr, conf.rpc_zmq_port)
 
         if method.__name__ == '_cast':
-            eventlet.spawn_n(method, _addr, context,
-                             _topic, _topic, msg, timeout, serialize,
-                             force_envelope)
+            _put_cast_buf([_addr, context,
+                           _topic, _topic, msg, timeout, serialize,
+                           force_envelope])
             return
         return method(_addr, context, _topic, _topic, msg, timeout,
                       serialize, force_envelope)
@@ -764,7 +769,38 @@ def cleanup():
     ZMQ_CTX = None
 
     global matchmaker
+    global ZMQ_CAST_POOL
+    global ZMQ_CAST_THREAD
+
+    ZMQ_CAST_POOL.waitall()
+    ZMQ_CAST_THREAD.kill()
+
     matchmaker = None
+
+
+#class CastBuffer(object):
+#    def __init__(self):
+#        self.pool
+#        self.buffer
+#        self.thread = 
+
+def _put_cast_buf(*msg)
+    global ZMQ_CAST_POOL
+    global ZMQ_CAST_BUFFER
+    global ZMQ_CAST_THREAD
+
+    if not ZMQ_CAST_POOL:
+        ZMQ_CAST_BUFFER = eventlet.queue.LightQueue()
+        ZMQ_CAST_POOL = eventlet.greenpool.GreenPool(
+            conf.rpc_conn_pool_size)
+
+        def publish():
+            while True:
+                ZMQ_CAST_POOL.spawn_n(_cast, *ZMQ_CAST_BUFFER.get())
+
+        ZMQ_CAST_THREAD = eventlet.spawn_n(publish)
+
+    ZMQ_CAST_BUFFER.put(*msg)
 
 
 def _get_ctxt():
