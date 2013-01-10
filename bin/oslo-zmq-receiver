@@ -67,7 +67,7 @@ def main():
         consumption_proxy = impl_zmq.InternalContext(None)
 
         reactor.register(consumption_proxy,
-                         consume_in, zmq.PULL, out_bind=True)
+                         [consume_in], zmq.PULL, out_bind=True)
 
         reactor.consume_in_thread()
         reactor.wait()

@@ -101,7 +101,7 @@ class _RpcZmqBaseTestCase(common.BaseRpcTestCase):
             consumption_proxy = impl_zmq.InternalContext(None)
 
             self.reactor.register(consumption_proxy,
-                                  consume_in,
+                                  [consume_in],
                                   zmq.PULL,
                                   out_bind=True)
             self.reactor.consume_in_thread()

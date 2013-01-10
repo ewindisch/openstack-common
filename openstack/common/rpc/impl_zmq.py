@@ -126,19 +126,18 @@ class ZmqSocket(object):
 
         for f in do_sub:
             self.subscribe(f)
-
-        str_data = {'addr': addr, 'type': self.socket_s(),
-                    'subscribe': subscribe, 'bind': bind}
-
-        LOG.debug(_("Connecting to %(addr)s with %(type)s"), str_data)
-        LOG.debug(_("-> Subscribed to %(subscribe)s"), str_data)
-        LOG.debug(_("-> bind: %(bind)s"), str_data)
+        LOG.info(_("Subscribed to %(subscribe)s"),
+                 {'subscribe': subscribe})
 
         try:
-            if bind:
-                self.sock.bind(addr)
-            else:
-                self.sock.connect(addr)
+            for a in addr:
+                method = ('connect', 'bind')[bind]
+                con_info = {'addr': a, 'type': self.socket_s(),
+                            'method': method}
+                LOG.info(_("%(method)s to %(addr)s with %(type)s"),
+                         con_info)
+                # Connect or bind to socket at address a
+                getattr(self.sock, method)(a)
         except Exception:
             raise RPCException(_("Could not open socket."))
 
@@ -202,8 +201,8 @@ class ZmqSocket(object):
 class ZmqClient(object):
     """Client for ZMQ sockets."""
 
-    def __init__(self, addr, socket_type=zmq.PUSH, bind=False):
-        self.outq = ZmqSocket(addr, socket_type, bind=bind)
+    def __init__(self, addresses, socket_type=zmq.PUSH, bind=False):
+        self.outq = ZmqSocket(addresses, socket_type, bind=bind)
 
     def cast(self, msg_id, topic, data, serialize=True, force_envelope=False):
         if serialize:
@@ -416,7 +415,7 @@ class ZmqProxy(ZmqBaseReactor):
         ipc_dir = CONF.rpc_zmq_ipc_dir
 
         self.topic_proxy['zmq_replies'] = \
-            ZmqSocket("ipc://%s/zmq_topic_zmq_replies" % (ipc_dir, ),
+            ZmqSocket(["ipc://%s/zmq_topic_zmq_replies" % (ipc_dir, )],
                       zmq.PUB, bind=True)
         self.sockets.append(self.topic_proxy['zmq_replies'])
 
@@ -444,7 +443,7 @@ class ZmqProxy(ZmqBaseReactor):
             sock_type = zmq.PUSH
 
         if not topic in self.topic_proxy:
-            outq = ZmqSocket("ipc://%s/zmq_topic_%s" % (ipc_dir, topic),
+            outq = ZmqSocket(["ipc://%s/zmq_topic_%s" % (ipc_dir, topic)],
                              sock_type, bind=True)
             self.topic_proxy[topic] = outq
             self.sockets.append(outq)
@@ -520,7 +519,7 @@ class Connection(rpc_common.Connection):
         LOG.debug(_("Consumer is a zmq.%s"),
                   ['PULL', 'SUB'][sock_type == zmq.SUB])
 
-        self.reactor.register(proxy, inaddr, sock_type,
+        self.reactor.register(proxy, [inaddr], sock_type,
                               subscribe=subscribe, in_bind=False)
 
     def close(self):
@@ -533,14 +532,20 @@ class Connection(rpc_common.Connection):
         self.reactor.consume_in_thread()
 
 
-def _cast(addr, context, msg_id, topic, msg, timeout=None, serialize=True,
-          force_envelope=False):
+def _cast(addresses, context, msg_id, topic, msg, timeout=None,
+          serialize=True, force_envelope=False):
+    """
+    @param: addresses list containing ZeroMQ addresses to connect to
+    @param: context openstack context
+    @param: msg_id message identifier for tracking (replies)
+    @param: topic messaging topic
+    """
     timeout_cast = timeout or CONF.rpc_cast_timeout
     payload = [RpcContext.marshal(context), msg]
 
     with Timeout(timeout_cast, exception=rpc_common.Timeout):
         try:
-            conn = ZmqClient(addr)
+            conn = ZmqClient(addresses)
 
             # assumes cast can't return an exception
             conn.cast(msg_id, topic, payload, serialize, force_envelope)
@@ -551,7 +556,8 @@ def _cast(addr, context, msg_id, topic, msg, timeout=None, serialize=True,
                 conn.close()
 
 
-def _call(addr, context, msg_id, topic, msg, timeout=None):
+def _call(addr, context, msg_id, topic, msg, timeout=None,
+          serialize=True, force_envelope=False):
     # timeout_response is how long we wait for a response
     timeout = timeout or CONF.rpc_response_timeout
 
@@ -581,12 +587,13 @@ def _call(addr, context, msg_id, topic, msg, timeout=None):
     with Timeout(timeout, exception=rpc_common.Timeout):
         try:
             msg_waiter = ZmqSocket(
-                "ipc://%s/zmq_topic_zmq_replies" % CONF.rpc_zmq_ipc_dir,
+                ["ipc://%s/zmq_topic_zmq_replies" % CONF.rpc_zmq_ipc_dir],
                 zmq.SUB, subscribe=msg_id, bind=False
             )
 
             LOG.debug(_("Sending cast"))
-            _cast(addr, context, msg_id, topic, payload)
+            _cast(addr, context, msg_id, topic, payload,
+                  serialize=serialize, force_envelope=force_envelope)
 
             LOG.debug(_("Cast sent; Waiting reply"))
             # Blocks until receives reply
@@ -633,16 +640,15 @@ def _multi_send(method, context, topic, msg, timeout=None, serialize=True,
         raise rpc_common.Timeout, "No match from matchmaker."
 
     # This supports brokerless fanout (addresses > 1)
-    for queue in queues:
-        (_topic, ip_addr) = queue
-        _addr = "tcp://%s:%s" % (ip_addr, conf.rpc_zmq_port)
+    addr = map(lambda y: "tcp://%s:%s" % (y[1], conf.rpc_zmq_port), queues)
 
-        if method.__name__ == '_cast':
-            eventlet.spawn_n(method, _addr, context,
-                             _topic, _topic, msg, timeout, serialize,
-                             force_envelope)
-            return
-        return method(_addr, context, _topic, _topic, msg, timeout)
+    if method.__name__ == '_cast':
+        eventlet.spawn_n(method, addr, context,
+                         topic, topic, msg, timeout, serialize,
+                         force_envelope)
+        return
+    return method(addr, context, topic, topic, msg, timeout,
+                  serialize, force_envelope)
 
 
 def create_connection(conf, new=True):
