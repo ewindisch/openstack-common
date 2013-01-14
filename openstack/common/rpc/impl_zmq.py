@@ -399,11 +399,24 @@ class ZmqBaseReactor(ConsumerBase):
             t.wait()
 
     def close(self):
-        for s in self.sockets:
+        """
+        Shutdown the reactor.
+         - Stops processing new messages,
+         - Stops accepting new messages,
+         - Closes all sockets.
+         - Waits for processes to end.
+       """
+        self.pool.resize(0)
+
+        while len(self.threads) > 0:
+            t = self.threads.pop()
+            t.kill()
+
+        while len(self.sockets) > 0:
+            s = self.sockets.pop()
             s.close()
 
-        for t in self.threads:
-            t.kill()
+        self.pool.waitall()
 
 
 class ZmqProxy(ZmqBaseReactor):
