@@ -211,16 +211,20 @@ class ZmqSocket(object):
 
 class ZmqClient(object):
     """Client for ZMQ sockets."""
+    CAST = 0
+    CALL = 1
+    FANOUT = 2
+    REPLY = 3
 
     def __init__(self, addr, socket_type=None, bind=False):
         if socket_type is None:
             socket_type = zmq.PUSH
         self.outq = ZmqSocket(addr, socket_type, bind=bind)
 
-    def cast(self, msg_id, topic, data, serialize=True, force_envelope=False):
+    def cast(self, style, msg_id, topic, data, serialize=True, force_envelope=False):
         if serialize:
             data = rpc_common.serialize_msg(data, force_envelope)
-        self.outq.send([str(msg_id), str(topic), str('cast'),
+        self.outq.send([str(msg_id), str(topic), style,
                         _serialize(data)])
 
     def close(self):
@@ -295,7 +299,7 @@ class InternalContext(object):
             ctx.replies)
 
         LOG.debug(_("Sending reply"))
-        cast(CONF, ctx, topic, {
+        _multi_send(_cast_reply, ctx, topic, {
             'method': '-process_reply',
             'args': {
                 'msg_id': msg_id,
@@ -321,17 +325,10 @@ class ConsumerBase(object):
             return [result]
 
     def process(self, style, target, proxy, ctx, data):
-        # Method starting with - are
-        # processed internally. (non-valid method name)
-        method = data['method']
-
-        # Internal method
-        # uses internal context for safety.
-        if data['method'][0] == '-':
+        # Support '-reply' for compatibility with Folsom
+        if style == ZmqClient.CALL or data['method'] == '-reply':
             # For reply / process_reply
-            method = method[1:]
-            if method == 'reply':
-                self.private_ctx.reply(ctx, proxy, **data['args'])
+            self.private_ctx.reply(ctx, proxy, **data['args'])
             return
 
         data.setdefault('version', None)
@@ -437,9 +434,11 @@ class ZmqProxy(ZmqBaseReactor):
         LOG.debug(_("CONSUMER GOT %s"), ' '.join(map(pformat, data)))
 
         # Handle zmq_replies magic
-        if topic.startswith('fanout~'):
+        # Topic comparisons requires for Folsom compat.
+        # - remove in H-release.
+        if style == ZmqClient.FANOUT or topic.startswith('fanout~'):
             sock_type = zmq.PUB
-        elif topic.startswith('zmq_replies'):
+        elif style == ZmqClient.REPLY or topic.startswith('zmq_replies'):
             sock_type = zmq.PUB
             inside = rpc_common.deserialize_msg(_deserialize(in_msg))
             msg_id = inside[-1]['args']['msg_id']
@@ -600,7 +599,7 @@ class Connection(rpc_common.Connection):
         self.reactor.consume_in_thread()
 
 
-def _cast(addr, context, msg_id, topic, msg, timeout=None, serialize=True,
+def _send_cast(style, addr, context, msg_id, topic, msg, timeout=None, serialize=True,
           force_envelope=False):
     timeout_cast = timeout or CONF.rpc_cast_timeout
     payload = [RpcContext.marshal(context), msg]
@@ -610,12 +609,24 @@ def _cast(addr, context, msg_id, topic, msg, timeout=None, serialize=True,
             conn = ZmqClient(addr)
 
             # assumes cast can't return an exception
-            conn.cast(msg_id, topic, payload, serialize, force_envelope)
+            conn.cast(style, msg_id, topic, payload, serialize, force_envelope)
         except zmq.ZMQError:
             raise RPCException("Cast failed. ZMQ Socket Exception")
         finally:
             if 'conn' in vars():
                 conn.close()
+
+
+def _cast(*args, **kwargs):
+    _send_cast(ZmqClient.CAST, *args, **kwargs)
+
+
+def _cast_reply(*args, **kwargs):
+    _send_cast(ZmqClient.REPLY, *args, **kwargs)
+
+
+def _cast_fanout(*args, **kwargs):
+    _send_cast(ZmqClient.FANOUT, *args, **kwargs)
 
 
 def _call(addr, context, msg_id, topic, msg, timeout=None,
@@ -633,7 +644,7 @@ def _call(addr, context, msg_id, topic, msg, timeout=None,
     # Curry the original request into a reply method.
     mcontext = RpcContext.marshal(context)
     payload = {
-        'method': '-reply',
+        'method': '-reply',  # Needed for folsom compat.
         'args': {
             'msg_id': msg_id,
             'context': mcontext,
@@ -654,7 +665,7 @@ def _call(addr, context, msg_id, topic, msg, timeout=None,
             )
 
             LOG.debug(_("Sending cast"))
-            _cast(addr, context, msg_id, topic, payload,
+            _cast(ZmqClient.CALL, addr, context, msg_id, topic, payload,
                   serialize=serialize, force_envelope=force_envelope)
 
             LOG.debug(_("Cast sent; Waiting reply"))
@@ -706,7 +717,7 @@ def _multi_send(method, context, topic, msg, timeout=None, serialize=True,
         (_topic, ip_addr) = queue
         _addr = "tcp://%s:%s" % (ip_addr, conf.rpc_zmq_port)
 
-        if method.__name__ == '_cast':
+        if method.__name__.startswith('_cast'):
             eventlet.spawn_n(method, _addr, context,
                              _topic, _topic, msg, timeout, serialize,
                              force_envelope)
@@ -739,7 +750,7 @@ def fanout_cast(conf, context, topic, msg, **kwargs):
     """Send a message to all listening and expect no reply."""
     # NOTE(ewindisch): fanout~ is used because it avoid splitting on .
     # and acts as a non-subtle hint to the matchmaker and ZmqProxy.
-    _multi_send(_cast, context, 'fanout~' + str(topic), msg, **kwargs)
+    _multi_send(_cast_fanout, context, 'fanout~' + str(topic), msg, **kwargs)
 
 
 def notify(conf, context, topic, msg, **kwargs):
