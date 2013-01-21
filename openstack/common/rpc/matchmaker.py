@@ -21,6 +21,7 @@ return keys for direct exchanges, per (approximate) AMQP parlance.
 import contextlib
 import itertools
 import json
+import socket
 
 from openstack.common import cfg
 from openstack.common.gettextutils import _
@@ -32,6 +33,9 @@ matchmaker_opts = [
     cfg.StrOpt('matchmaker_ringfile',
                default='/etc/nova/matchmaker_ring.json',
                help='Matchmaker ring file (JSON)'),
+    cfg.StrOpt('matchmaker_dns_root',
+               default='.local',
+               help='DNS root to search.'),
 ]
 
 CONF = cfg.CONF
@@ -138,6 +142,39 @@ class StubExchange(Exchange):
         return [(key, None)]
 
 
+class FanoutDNSExchange(Exchange):
+    """
+    Match Maker performing host lookups from DNS.
+    """
+    def __init__(self):
+        super(FanoutDNSExchange, self).__init__()
+
+    def run(self, topic):
+        topic = topic.split('~', 1)[-1]
+        try:
+            (name, alias, addrlist) = \
+                socket.gethostbyname_ex(topic + CONF.matchmaker_dns_root)
+        except socket.gaierror as e:
+            LOG.error("Error resolving DNS:\n%s" % e)
+            LOG.error(topic + CONF.matchmaker_dns_root)
+            raise MatchMakerException()
+
+        return map(lambda host: (topic + '.' + host, host), addrlist)
+
+
+class RoundRobinDNSExchange(Exchange):
+    """
+    Match Maker performing host lookups from DNS.
+    """
+    def __init__(self):
+        super(RoundRobinDNSExchange, self).__init__()
+
+    def run(self, topic):
+        addr = socket.gethostbyname(topic +
+                                    CONF.matchmaker_dns_root)
+        return [(topic + '.' + addr, addr)]
+
+
 class RingExchange(Exchange):
     """
     Match Maker where hosts are loaded from a static file containing
@@ -219,6 +256,17 @@ class DirectExchange(Exchange):
     def run(self, key):
         b, e = key.split('.', 1)
         return [(b, e)]
+
+
+class MatchMakerDNS(MatchMakerBase):
+    """
+    Match Maker where hosts are loaded from a static hashmap.
+    """
+    def __init__(self, ring=None):
+        super(MatchMakerDNS, self).__init__()
+        self.add_binding(FanoutBinding(), FanoutDNSExchange())
+        self.add_binding(DirectBinding(), DirectExchange())
+        self.add_binding(TopicBinding(), RoundRobinDNSExchange())
 
 
 class MatchMakerRing(MatchMakerBase):

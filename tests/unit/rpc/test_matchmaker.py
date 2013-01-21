@@ -15,15 +15,17 @@
 #    under the License.
 
 import logging
+import socket
 import unittest
 
 from openstack.common.rpc import matchmaker
+from tests import utils as test_utils
 
 
 LOG = logging.getLogger(__name__)
 
 
-class _MatchMakerTestCase(unittest.TestCase):
+class _MatchMakerTestCase(test_utils.BaseTestCase):
     def test_valid_host_matches(self):
         queues = self.driver.queues(self.topic)
         matched_hosts = map(lambda x: x[1], queues)
@@ -58,3 +60,16 @@ class MatchMakerLocalhostTestCase(_MatchMakerTestCase):
         self.topic = "test"
         self.hosts = ['localhost']
         super(MatchMakerLocalhostTestCase, self).setUp()
+
+
+class MatchMakerDNSTestCase(_MatchMakerTestCase):
+    def setUp(self):
+        """
+           Test that DNS matchmaking works by assuming
+           localhost resolves to 127.0.0.1
+        """
+        self.config(matchmaker_dns_root='')
+        self.driver = matchmaker.MatchMakerDNS()
+        self.topic = "localhost"
+        self.hosts = ['127.0.0.1']
+        super(MatchMakerDNSTestCase, self).setUp()
