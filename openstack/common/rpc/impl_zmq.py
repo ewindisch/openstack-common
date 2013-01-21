@@ -85,7 +85,7 @@ CONF.register_opts(zmq_opts)
 
 ZMQ_CTX = None  # ZeroMQ Context, must be global.
 matchmaker = None  # memoized matchmaker object
-ZMQ_CAST_POOL = None  # GreenPool for casts
+ZMQ_CAST_BUFFER = None  # Local queue for casts
 
 
 def _serialize(data):
@@ -778,28 +778,21 @@ def cleanup():
     matchmaker = None
 
 
-#class CastBuffer(object):
-#    def __init__(self):
-#        self.pool
-#        self.buffer
-#        self.thread = 
-
-def _put_cast_buf(*msg)
-    global ZMQ_CAST_POOL
-    global ZMQ_CAST_BUFFER
-    global ZMQ_CAST_THREAD
-
-    if not ZMQ_CAST_POOL:
-        ZMQ_CAST_BUFFER = eventlet.queue.LightQueue()
-        ZMQ_CAST_POOL = eventlet.greenpool.GreenPool(
-            conf.rpc_conn_pool_size)
+class _ZmqCastBuffer(eventlet.queue.LightQueue):
+    def __init__(self):
+        self.pool = eventlet.greenpool.GreenPool(conf.rpc_conn_pool_size)
 
         def publish():
             while True:
-                ZMQ_CAST_POOL.spawn_n(_cast, *ZMQ_CAST_BUFFER.get())
+                self.pool.spawn_n(_cast, *self.buffer.get())
 
-        ZMQ_CAST_THREAD = eventlet.spawn_n(publish)
+        self.thread = eventlet.spawn_n(publish)
+        super(CastBuffer, self).__init__()
 
+
+def _put_cast_buf(*msg)
+    global ZMQ_CAST_BUFFER
+    ZMQ_CAST_BUFFER = ZMQ_CAST_BUFFER or _ZmqCastBuffer()
     ZMQ_CAST_BUFFER.put(*msg)
 
 
