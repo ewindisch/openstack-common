@@ -22,6 +22,7 @@ import contextlib
 import eventlet
 import itertools
 import json
+import socket
 
 from openstack.common import cfg
 from openstack.common import importutils
@@ -29,7 +30,7 @@ from openstack.common.gettextutils import _
 from openstack.common import log as logging
 
 redis = importutils.try_import('redis')
-
+dns = importutils.try_import('dns')
 
 matchmaker_opts = [
     # Matchmaker ring file
@@ -48,6 +49,15 @@ matchmaker_opts = [
     cfg.IntOpt('matchmaker_redis_port',
                default=6379,
                help='Use this port to connect to redis host.'),
+    cfg.StrOpt('matchmaker_dns_root',
+               default='.local',
+               help='DNS root to search.'),
+    cfg.StrOpt('matchmaker_dns_tsig_file',
+               default='/etc/openstack/matchmaker_dns.tsig',
+               help="Path to tsig key."),
+    cfg.StrOpt('matchmaker_dns_tsig_algo',
+               default=None,
+               help="Algorithm for dns tsig authentication."),
 ]
 
 CONF = cfg.CONF
@@ -293,6 +303,43 @@ class StubExchange(Exchange):
         return [(key, None)]
 
 
+class FanoutDNSExchange(Exchange):
+    """
+    Match Maker performing host lookups from DNS.
+    """
+    def __init__(self):
+        super(FanoutDNSExchange, self).__init__()
+
+    def run(self, topic):
+        topic = topic.split('~', 1)[-1]
+        record_name = '.'.join(reversed(topic.split('.', 1)))
+
+        try:
+            (name, alias, addrlist) = \
+                socket.gethostbyname_ex(
+                    record_name + CONF.matchmaker_dns_root)
+        except socket.gaierror as e:
+            LOG.error("Error resolving DNS:\n%s" % e)
+            LOG.error(topic + CONF.matchmaker_dns_root)
+            raise MatchMakerException()
+
+        return map(lambda host: (topic + '.' + host, host), addrlist)
+
+
+class RoundRobinDNSExchange(Exchange):
+    """
+    Match Maker performing host lookups from DNS.
+    """
+    def __init__(self):
+        super(RoundRobinDNSExchange, self).__init__()
+
+    def run(self, topic):
+        record_name = '.'.join(reversed(topic.split('.', 1)))
+        addr = socket.gethostbyname(record_name +
+                                    CONF.matchmaker_dns_root)
+        return [(topic + '.' + addr, addr)]
+
+
 class RingExchange(Exchange):
     """
     Match Maker where hosts are loaded from a static file containing
@@ -492,6 +539,59 @@ class MatchMakerRedis(HeartbeatMatchMakerBase):
     def stop_heartbeat(self):
         if self._heart:
             self._heart.kill()
+
+
+class MatchMakerDNS(MatchMakerBase):
+    """
+    Match Maker where hosts are discovered via DNS.
+    """
+    def __init__(self, ring=None):
+        super(MatchMakerDNS, self).__init__()
+
+        self.add_binding(FanoutBinding(), FanoutDNSExchange())
+        self.add_binding(DirectBinding(), DirectExchange())
+        self.add_binding(TopicBinding(), RoundRobinDNSExchange())
+
+
+class MatchMakerDynDNS(HeartbeatMatchMakerBase):
+    """
+    Match Maker where hosts are discovered via DNS.
+    Dynamic dns updates are sent to register hosts.
+    """
+    def __init__(self, ring=None):
+        super(MatchMakerDynDNS, self).__init__()
+
+        self.add_binding(FanoutBinding(), FanoutDNSExchange())
+        self.add_binding(DirectBinding(), DirectExchange())
+        self.add_binding(TopicBinding(), RoundRobinDNSExchange())
+
+    def ack_alive(self, key):
+        ## Should re-register here, but missing host/key_host!
+        ## self.dns.register(key)
+        pass
+
+    def is_alive(self, topic, host):
+        return True
+
+    def backend_register(self, key, key_host):
+        zone = '.'.join((key, CONF.matchmaker_dns_root))
+        record_name = '.'.join(reversed(key_host.split('.', 1)))
+        tsig_key_ring = {}
+        tsig_key_ring[key_host] = self._load_tsig()
+        dns_updater = self.dns.update.Update(zone,
+            keyring=tsig_key_ring,
+            keyalgorithm=CONF.matchmaker_dns_tsig_algo)
+        dns_updater.add(record_name)
+
+    def backend_unregister(self, key, key_host):
+        zone = '.'.join((key, CONF.matchmaker_dns_root))
+        record_name = '.'.join(reversed(key_host.split('.', 1)))
+        tsig_key_ring = {}
+        tsig_key_ring[key_host] = self._load_tsig()
+        dns_updater = self.dns.update.Update(zone,
+            keyring=tsig_key_ring,
+            keyalgorithm=CONF.matchmaker_dns_tsig_algo)
+        dns_updater.delete(record_name)
 
 
 class MatchMakerRing(MatchMakerBase):

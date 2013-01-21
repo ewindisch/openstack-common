@@ -18,6 +18,7 @@ import eventlet
 import logging
 import nose
 from tests import utils as test_utils
+import socket
 
 from openstack.common import importutils
 from openstack.common.rpc import matchmaker
@@ -176,3 +177,16 @@ class MatchMakerRedisHeartbeatTestCase(_MatchMakerDynRegTestCase):
         """
         self.test_expires_hosts()
         self.assertEqual(self.driver.queues(self.topic), [])
+
+
+class MatchMakerDNSTestCase(_MatchMakerTestCase):
+    def setUp(self):
+        """
+           Test that DNS matchmaking works by assuming
+           localhost resolves to 127.0.0.1
+        """
+        self.config(matchmaker_dns_root='')
+        self.driver = matchmaker.MatchMakerDNS()
+        self.topic = "localhost"
+        self.hosts = ['127.0.0.1']
+        super(MatchMakerDNSTestCase, self).setUp()
