@@ -454,9 +454,33 @@ class ZmqProxy(ZmqBaseReactor):
                 LOG.info(_("Creating proxy for topic: %s"), topic)
 
                 try:
-                    out_sock = ZmqSocket("ipc://%s/zmq_topic_%s" %
-                                         (ipc_dir, topic),
+                    sock_file = "ipc://%s/zmq_topic_%s" % (ipc_dir, topic)
+                    out_sock = ZmqSocket(sock_file,
                                          sock_type, bind=True)
+                    if sock_type == zmq.PUB:
+                        def _w_pub_send():
+                            while True:
+                                LOG.debug("ack!")
+                                out_sock.send(['ack'])
+                                LOG.debug("sent. go the fuck to sleep.")
+                                eventlet.sleep(.1)
+
+                        # PUB sockets can take some time to
+                        # open/connect, so we can test by
+                        # sending ourself a message.
+                        in_sock = ZmqSocket(sock_file, zmq.SUB,
+                                            bind=False, subscribe='ack')
+
+                        try:
+                            w_pub = eventlet.spawn(in_sock.recv)
+                            w_pub_wait = eventlet.spawn(_w_pub_send)
+                            LOG.debug("Waiting for ack.")
+                            w_pub.wait()
+                            LOG.debug("Received ack.")
+                        finally:
+                            w_pub.kill()
+                            w_pub_wait.kill()
+
                 except RPCException:
                     waiter.send_exception(*sys.exc_info())
                     return
@@ -464,11 +488,6 @@ class ZmqProxy(ZmqBaseReactor):
                 self.topic_proxy[topic] = eventlet.queue.LightQueue(
                     CONF.rpc_zmq_topic_backlog)
                 self.sockets.append(out_sock)
-
-                # It takes some time for a pub socket to open,
-                # before we can have any faith in doing a send() to it.
-                if sock_type == zmq.PUB:
-                    eventlet.sleep(.5)
 
                 waiter.send(True)
 
@@ -483,8 +502,9 @@ class ZmqProxy(ZmqBaseReactor):
 
             try:
                 wait_sock_creation.wait()
-            except RPCException:
-                LOG.error(_("Topic socket file creation failed."))
+            except RPCException as e:
+                LOG.error(_("Topic socket file creation failed: %s" %
+                    (e, )))
                 return
 
         try:
