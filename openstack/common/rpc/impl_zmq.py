@@ -90,7 +90,7 @@ def _serialize(data):
     Error if a developer passes us bad data.
     """
     try:
-        return str(jsonutils.dumps(data, ensure_ascii=True))
+        return jsonutils.dumps(data, ensure_ascii=True)
     except TypeError:
         LOG.error(_("JSON serialization failed."))
         raise
@@ -222,15 +222,22 @@ class ZmqClient(object):
         self.outq = ZmqSocket(addr, socket_type, bind=bind)
 
     def cast(self, style, topic, data, serialize=True, force_envelope=False):
+        msg_id = 0
+        #if style in (ZmqClient.REPLY, ZmqClient.CALL) and 
+        #if 'args' in data and 'msg_id' in data['args']:
+        LOG.debug("Data: %s" % data)
+
+        msg = data[-1]
+        if 'args' in msg and 'msg_id' in msg['args']:
+            msg_id = msg['args']['msg_id']
+
         if serialize:
             data = rpc_common.serialize_msg(data, force_envelope)
 
-        msg_id = 0
-        if style in (ZmqClient.REPLY, ZmqClient.FANOUT) and 'msg_id' in data:
-            msg_id = data['msg_id']
-
-        self.outq.send([msg_id, str(topic), style,
-                        _serialize(data)])
+        self.outq.send(map(bytes, (msg_id, topic, style,
+                        _serialize(data))))
+        #self.outq.send([str(msg_id), str(topic), str(style),
+        #        _serialize(data)])
 
     def close(self):
         self.outq.close()
@@ -304,7 +311,7 @@ class InternalContext(object):
             ctx.replies)
 
         LOG.debug(_("Sending reply"))
-        _multi_send(_cast_reply, ctx, topic, {
+        _multi_send(ZmqClient.REPLY, ctx, topic, {
             'method': '-process_reply',
             'args': {
                 'msg_id': msg_id,
@@ -442,9 +449,9 @@ class ZmqProxy(ZmqBaseReactor):
         # String comparisons requires for Folsom compat.
         # TODO(ewindisch): remove string cmps in H-release+
         sock_type = zmq.PUSH
-        if style in (ZmqClient.FANOUT, ZmqClient.REPLY) or
-                topic.startswith('fanout~') or
-                topic.startswith('zmq_replies')
+        if style in (ZmqClient.FANOUT, ZmqClient.REPLY) or \
+                topic.startswith('fanout~') or \
+                topic.startswith('zmq_replies'):
             sock_type = zmq.PUB
 
         if not topic in self.topic_proxy:
@@ -598,7 +605,7 @@ class Connection(rpc_common.Connection):
         self.reactor.consume_in_thread()
 
 
-def _send_cast(style, addr, context, topic, msg, timeout=None, serialize=True,
+def _cast(style, addr, context, topic, msg, timeout=None, serialize=True,
           force_envelope=False):
     timeout_cast = timeout or CONF.rpc_cast_timeout
     payload = [RpcContext.marshal(context), msg]
@@ -616,16 +623,16 @@ def _send_cast(style, addr, context, topic, msg, timeout=None, serialize=True,
                 conn.close()
 
 
-def _cast(*args, **kwargs):
-    _send_cast(ZmqClient.CAST, *args, **kwargs)
-
-
-def _cast_reply(*args, **kwargs):
-    _send_cast(ZmqClient.REPLY, *args, **kwargs)
-
-
-def _cast_fanout(*args, **kwargs):
-    _send_cast(ZmqClient.FANOUT, *args, **kwargs)
+#def _cast(*args, **kwargs):
+#    _send_cast(ZmqClient.CAST, *args, **kwargs)
+#
+#
+#def _cast_reply(*args, **kwargs):
+#    _send_cast(ZmqClient.REPLY, *args, **kwargs)
+#
+#
+#def _cast_fanout(*args, **kwargs):
+#    _send_cast(ZmqClient.FANOUT, *args, **kwargs)
 
 
 def _call(addr, context, topic, msg, timeout=None,
@@ -672,7 +679,7 @@ def _call(addr, context, topic, msg, timeout=None,
             msg = msg_waiter.recv()
             LOG.debug(_("Received message: %s"), msg)
             LOG.debug(_("Unpacking response"))
-            responses = _deserialize(msg[-1])['args']['response']
+            responses = _deserialize(msg[-1])[-1]['args']['response']
         # ZMQError trumps the Timeout error.
         except zmq.ZMQError:
             raise RPCException("ZMQ Socket Error")
@@ -691,7 +698,7 @@ def _call(addr, context, topic, msg, timeout=None,
     return responses[-1]
 
 
-def _multi_send(method, context, topic, msg, timeout=None, serialize=True,
+def _multi_send(style, context, topic, msg, timeout=None, serialize=True,
                 force_envelope=False):
     """
     Wraps the sending of messages,
@@ -711,18 +718,22 @@ def _multi_send(method, context, topic, msg, timeout=None, serialize=True,
         # this exception and a timeout isn't too big a lie.
         raise rpc_common.Timeout, "No match from matchmaker."
 
+    # timeout
+    if style == ZmqClient.CALL:
+        (_topic, ip_addr) = queues[0]
+        _addr = "tcp://%s:%s" % (ip_addr, conf.rpc_zmq_port)
+        return _call(_addr, context, _topic, msg, timeout,
+              serialize, force_envelope)
+
     # This supports brokerless fanout (addresses > 1)
     for queue in queues:
         (_topic, ip_addr) = queue
         _addr = "tcp://%s:%s" % (ip_addr, conf.rpc_zmq_port)
 
-        if method.__name__.startswith('_cast'):
-            eventlet.spawn_n(method, _addr, context,
-                             _topic, _topic, msg, timeout, serialize,
-                             force_envelope)
-            return
-        return method(_addr, context, _topic, _topic, msg, timeout,
-                      serialize, force_envelope)
+        #eventlet.spawn_n(_cast, style, _addr, context,
+        _cast(style, _addr, context,
+                         _topic, msg, timeout, serialize,
+                         force_envelope)
 
 
 def create_connection(conf, new=True):
@@ -731,25 +742,25 @@ def create_connection(conf, new=True):
 
 def multicall(conf, *args, **kwargs):
     """Multiple calls."""
-    return _multi_send(_call, *args, **kwargs)
+    return _multi_send(ZmqClient.CALL, *args, **kwargs)
 
 
 def call(conf, *args, **kwargs):
     """Send a message, expect a response."""
-    data = _multi_send(_call, *args, **kwargs)
+    data = _multi_send(ZmqClient.CALL, *args, **kwargs)
     return data[-1]
 
 
 def cast(conf, *args, **kwargs):
     """Send a message expecting no reply."""
-    _multi_send(_cast, *args, **kwargs)
+    _multi_send(ZmqClient.CAST, *args, **kwargs)
 
 
 def fanout_cast(conf, context, topic, msg, **kwargs):
     """Send a message to all listening and expect no reply."""
     # NOTE(ewindisch): fanout~ is used because it avoid splitting on .
     # and acts as a non-subtle hint to the matchmaker and ZmqProxy.
-    _multi_send(_cast_fanout, context, 'fanout~' + str(topic), msg, **kwargs)
+    _multi_send(ZmqClient.FANOUT, context, 'fanout~' + str(topic), msg, **kwargs)
 
 
 def notify(conf, context, topic, msg, **kwargs):
