@@ -260,11 +260,9 @@ class InternalContext(object):
         self.proxy = proxy
         self.msg_waiter = None
 
-    def _get_response(self, ctx, proxy, topic, data):
-        """Process a curried message and cast the result to topic."""
+    def _get_response(self, ctx, proxy, data):
+        """Process a curried message, result"""
         LOG.debug(_("Running func with context: %s"), ctx.to_dict())
-        data.setdefault('version', None)
-        data.setdefault('args', {})
 
         try:
             result = proxy.dispatch(
@@ -284,16 +282,7 @@ class InternalContext(object):
             return {'exc':
                     rpc_common.serialize_remote_exception(sys.exc_info())}
 
-    def reply(self, ctx, proxy,
-              msg_id=None, context=None, topic=None, msg=None):
-        """Reply to a casted call."""
-        # Our real method is curried into msg['args']
-
-        child_ctx = RpcContext.unmarshal(msg[0])
-        response = ConsumerBase.normalize_reply(
-            self._get_response(child_ctx, proxy, topic, msg[1]),
-            ctx.replies)
-
+    def send_reply(self, ctx, msg_id, topic, response):
         LOG.debug(_("Sending reply"))
         cast(CONF, ctx, topic, {
             'method': '-process_reply',
@@ -302,6 +291,17 @@ class InternalContext(object):
                 'response': response
             }
         })
+
+    def reply(self, ctx, proxy,
+              msg_id=None, context=None, msg=None):
+        """Reply to a casted call."""
+        # Our real method is curried into msg['args']
+
+        child_ctx = RpcContext.unmarshal(msg[0])
+        response = ConsumerBase.normalize_reply(
+            self._get_response(child_ctx, proxy, msg[1]),
+            ctx.replies)
+        self.send_reply(ctx, msg_id, topic, response)
 
 
 class ConsumerBase(object):
@@ -323,30 +323,32 @@ class ConsumerBase(object):
     def process(self, style, target, proxy, ctx, data):
         data.setdefault('version', None)
         data.setdefault('args', {})
-
-        # Method starting with - are
-        # processed internally. (non-valid method name)
         method = data.get('method')
+
         if not method:
-            if 'msg_id' not in data:
+            LOG.warn(_("Ingress RPC message method not specified."))
+
+        # Internal method - uses internal context for safety.
+        if method == '-reply':
+            if 'msg_id' not in data['args']:
                 LOG.error(_("Ingress RPC call did not include msg_id."))
                 return
 
-            LOG.warn(_("Ingress RPC call did not include method."))
+            if 'topic' not in data['args']:
+                LOG.error(_("Ingress RPC call did not include topic."))
+                return
 
-            child_ctx = RpcContext.unmarshal(msg[0])
-            cast(CONF, child_ctx, topic, {
-                'method': '-process_reply',
-                'args': {
-                    'msg_id': data['msg_id'],
-                    'response': _('No method for message: %s') % data
-                }
-            })
-            return
+            if 'msg' not in data:
+                LOG.warn(_("RPC reply request incomplete."))
+                try:
+                    raise RPCException(_("RPC reply request incomplete."))
+                except RPCException:
+                    msg_id = data['args']['msg_id']
+                    topic = data['args']['topic']
+                    self.private_ctx.send_reply(ctx, msg_id, topic,
+                        {'exc': rpc_common.serialize_remote_exception(sys.exc_info())})
+                return
 
-        # Internal method
-        # uses internal context for safety.
-        if method == '-reply':
             self.private_ctx.reply(ctx, proxy, **data['args'])
             return
 
