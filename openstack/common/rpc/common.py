@@ -414,14 +414,16 @@ def version_is_compatible(imp_version, version):
     return True
 
 
-def serialize_msg(raw_msg, force_envelope=False):
+def serialize_msg(raw_msg, topic, msg_id, force_envelope=False):
     if not _SEND_RPC_ENVELOPE and not force_envelope:
         return raw_msg
 
     # NOTE(russellb) See the docstring for _RPC_ENVELOPE_VERSION for more
     # information about this format.
     msg = {_VERSION_KEY: _RPC_ENVELOPE_VERSION,
-           _MESSAGE_KEY: jsonutils.dumps(raw_msg)}
+           _MESSAGE_KEY: jsonutils.dumps(raw_msg),
+           'topic': topic,
+           'msg_id': msg_id}
 
     return msg
 
@@ -468,3 +470,8 @@ def deserialize_msg(msg):
     raw_msg = jsonutils.loads(msg[_MESSAGE_KEY])
 
     return raw_msg
+
+def sign_envelope(raw_envelope):
+    if not CONF.rpc_message_signing:
+        return False
+
