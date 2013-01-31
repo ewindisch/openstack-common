@@ -82,23 +82,17 @@ class _RpcZmqBaseTestCase(common.BaseRpcTestCase):
             # TODO(mordred): replace this with testresources once we're on
             #                testr
             self.config(rpc_zmq_port=get_unused_port())
-            internal_ipc_dir = self.useFixture(fixtures.TempDir()).path
-            self.config(rpc_zmq_ipc_dir=internal_ipc_dir)
-
-            LOG.info(_("Running internal zmq receiver."))
-            reactor = impl_zmq.ZmqProxy(FLAGS)
-            self.addCleanup(self._close_reactor)
-            reactor.consume_in_thread()
+            #internal_ipc_dir = self.useFixture(fixtures.TempDir()).path
+            #self.config(rpc_zmq_ipc_dir=internal_ipc_dir)
+            self.config(rpc_zmq_proxy_inprocess=True)
         else:
             LOG.warning(_("Detected zmq-receiver socket."))
             LOG.warning(_("Assuming nova-rpc-zmq-receiver is running."))
             LOG.warning(_("Using system zmq receiver deamon."))
+
+        self.addCleanup(impl_zmq.cleanup)
         super(_RpcZmqBaseTestCase, self).setUp(
             topic=topic, topic_nested=topic_nested)
-
-    def _close_reactor(self):
-        if self.reactor:
-            self.reactor.close()
 
 
 class RpcZmqBaseTopicTestCase(_RpcZmqBaseTestCase):

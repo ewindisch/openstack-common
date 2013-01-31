@@ -72,7 +72,13 @@ zmq_opts = [
 
     cfg.StrOpt('rpc_zmq_host', default=socket.gethostname(),
                help='Name of this node. Must be a valid hostname, FQDN, or '
-                    'IP address. Must match "host" option, if running Nova.')
+                    'IP address. Must match "host" option, if running Nova.'),
+
+    cfg.BoolOpt('rpc_zmq_proxy_inprocess', default=False,
+                help='Spawns the ZmqProxy in process in lieu of '
+                     'requiring bin/oslo-zmq-receiver. '
+                     'WARNING: prevents using impl_zmq '
+                     'from more than one system process.'),
 ]
 
 
@@ -80,6 +86,8 @@ CONF = cfg.CONF
 CONF.register_opts(zmq_opts)
 
 ZMQ_CTX = None  # ZeroMQ Context, must be global.
+ZMQ_PROXY = None
+ZMQ_PROXY_THREAD = None
 matchmaker = None  # memoized matchmaker object
 
 
@@ -454,8 +462,13 @@ class ZmqProxy(ZmqBaseReactor):
                 LOG.info(_("Creating proxy for topic: %s"), topic)
 
                 try:
-                    out_sock = ZmqSocket("ipc://%s/zmq_topic_%s" %
-                                         (ipc_dir, topic),
+                    if CONF.rpc_zmq_proxy_inprocess:
+                        sock_path = "inproc://"
+                    else:
+                        sock_path = "ipc://%s/" % (ipc_dir, )
+
+                    out_sock = ZmqSocket(sock_path + "zmq_topic_%s" %
+                                         (topic, ),
                                          sock_type, bind=True)
                 except RPCException:
                     waiter.send_exception(*sys.exc_info())
@@ -581,8 +594,12 @@ class Connection(rpc_common.Connection):
             subscribe = None
 
         # Receive messages from (local) proxy
-        inaddr = "ipc://%s/zmq_topic_%s" % \
-            (CONF.rpc_zmq_ipc_dir, topic)
+        if CONF.rpc_zmq_proxy_inprocess:
+            sock_path = "inproc://"
+        else:
+            sock_path = "ipc://%s/%s/" % (ipc_dir, CONF.rpc_zmq_ipc_dir)
+
+        inaddr = sock_path + "zmq_topic_%s" % (topic, )
 
         LOG.debug(_("Consumer is a zmq.%s"),
                   ['PULL', 'SUB'][sock_type == zmq.SUB])
@@ -597,6 +614,8 @@ class Connection(rpc_common.Connection):
         self.reactor.wait()
 
     def consume_in_thread(self):
+        if CONF.rpc_zmq_proxy_inprocess:
+            _spawn_proxy()
         self.reactor.consume_in_thread()
 
 
@@ -648,8 +667,13 @@ def _call(addr, context, msg_id, topic, msg, timeout=None,
     # TODO(ewindisch): have reply consumer with dynamic subscription mgmt
     with Timeout(timeout, exception=rpc_common.Timeout):
         try:
+            if CONF.rpc_zmq_proxy_inprocess:
+                sock_path = "inproc://"
+            else:
+                sock_path = "ipc://%s/%s/" % (ipc_dir, CONF.rpc_zmq_ipc_dir)
+
             msg_waiter = ZmqSocket(
-                "ipc://%s/zmq_topic_zmq_replies" % CONF.rpc_zmq_ipc_dir,
+                sock_path + "zmq_topic_zmq_replies",
                 zmq.SUB, subscribe=msg_id, bind=False
             )
 
@@ -721,6 +745,8 @@ def create_connection(conf, new=True):
 
 def multicall(conf, *args, **kwargs):
     """Multiple calls."""
+    if conf.rpc_zmq_proxy_inprocess:
+        _spawn_proxy()
     return _multi_send(_call, *args, **kwargs)
 
 
@@ -759,12 +785,31 @@ def notify(conf, context, topic, msg, **kwargs):
 def cleanup():
     """Clean up resources in use by implementation."""
     global ZMQ_CTX
-    if ZMQ_CTX:
-        ZMQ_CTX.term()
+    global ZMQ_PROXY
+    global ZMQ_PROXY_THRAD
+
+    if ZMQ_PROXY:
+        ZMQ_PROXY.close()
+        ZMQ_PROXY = None
+    if ZMQ_PROXY_THREAD:
+        ZMQ_PROXY_THREAD.kill()
+
+    #if ZMQ_CTX:
+    #    ZMQ_CTX.term()
     ZMQ_CTX = None
 
     global matchmaker
     matchmaker = None
+
+
+def _spawn_proxy():
+    global ZMQ_PROXY
+    global ZMQ_PROXY_THREAD
+    if ZMQ_PROXY and ZMQ_PROXY_THREAD:
+        return
+
+    ZMQ_PROXY = ZmqProxy(CONF)
+    ZMQ_PROXY_THREAD = eventlet.spawn(ZMQ_PROXY.consume_in_thread)
 
 
 def _get_ctxt():
