@@ -432,13 +432,13 @@ class ZmqProxy(ZmqBaseReactor):
         #TODO(ewindisch): use zero-copy (i.e. references, not copying)
         data = sock.recv()
         msg_id, topic, style, in_msg = data
-        topic = topic.split('.', 1)[0]
 
         LOG.debug(_("CONSUMER GOT %s"), ' '.join(map(pformat, data)))
 
         # Handle zmq_replies magic
         if topic.startswith('fanout~'):
             sock_type = zmq.PUB
+            topic = topic.split('.', 1)[0]
         elif topic.startswith('zmq_replies'):
             sock_type = zmq.PUB
             inside = rpc_common.deserialize_msg(_deserialize(in_msg))
@@ -562,23 +562,23 @@ class Connection(rpc_common.Connection):
     """Manages connections and threads."""
 
     def __init__(self, conf):
+        self.topics = []
         self.reactor = ZmqReactor(conf)
 
     def create_consumer(self, topic, proxy, fanout=False):
-        # Only consume on the base topic name.
-        topic = topic.split('.', 1)[0]
-
-        LOG.info(_("Create Consumer for topic (%(topic)s)") %
-                 {'topic': topic})
-
         # Subscription scenarios
         if fanout:
-            subscribe = ('', fanout)[type(fanout) == str]
             sock_type = zmq.SUB
-            topic = 'fanout~' + topic
+            subscribe = ('', fanout)[type(fanout) == str]
+            topic = 'fanout~' + topic.split('.', 1)[0]
         else:
             sock_type = zmq.PULL
             subscribe = None
+            topic = '.'.join((topic.split('.', 1)[0], CONF.rpc_zmq_host))
+
+        if topic in self.topics:
+            LOG.info(_("Skipping topic registration. Already registered."))
+            return
 
         # Receive messages from (local) proxy
         inaddr = "ipc://%s/zmq_topic_%s" % \
@@ -589,9 +589,11 @@ class Connection(rpc_common.Connection):
 
         self.reactor.register(proxy, inaddr, sock_type,
                               subscribe=subscribe, in_bind=False)
+        self.topics.append(topic)
 
     def close(self):
         self.reactor.close()
+        self.topics = []
 
     def wait(self):
         self.reactor.wait()
@@ -649,7 +651,9 @@ def _call(addr, context, msg_id, topic, msg, timeout=None,
     with Timeout(timeout, exception=rpc_common.Timeout):
         try:
             msg_waiter = ZmqSocket(
-                "ipc://%s/zmq_topic_zmq_replies" % CONF.rpc_zmq_ipc_dir,
+                "ipc://%s/zmq_topic_zmq_replies.%s" %
+                (CONF.rpc_zmq_ipc_dir,
+                 CONF.rpc_zmq_host),
                 zmq.SUB, subscribe=msg_id, bind=False
             )
 
@@ -777,7 +781,7 @@ def _get_ctxt():
     return ZMQ_CTX
 
 
-def _get_matchmaker():
+def _get_matchmaker(*args, **kwargs):
     global matchmaker
     if not matchmaker:
         # rpc_zmq_matchmaker should be set to a 'module.Class'
@@ -793,5 +797,5 @@ def _get_matchmaker():
 
         mm_impl = importutils.import_module(mm_module)
         mm_constructor = getattr(mm_impl, mm_class)
-        matchmaker = mm_constructor()
+        matchmaker = mm_constructor(*args, **kwargs)
     return matchmaker
