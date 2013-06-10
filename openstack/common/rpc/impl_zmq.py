@@ -441,60 +441,55 @@ class ZmqProxy(ZmqBaseReactor):
 
         self.topic_proxy = {}
 
-    def consume(self, sock):
+    def publisher(self, sock_type, topic, waiter):
         ipc_dir = CONF.rpc_zmq_ipc_dir
 
+        LOG.info(_("Creating proxy for topic: %s"), topic)
+        try:
+            # The topic is received over the network,
+            # don't trust this input.
+            if self.badchars.search(topic) is not None:
+                emsg = _("Topic contained dangerous characters.")
+                LOG.warn(emsg)
+                raise RPCException(emsg)
+
+            out_sock = ZmqSocket("ipc://%s/zmq_topic_%s" %
+                                 (ipc_dir, topic),
+                                 sock_type, bind=True)
+        except RPCException:
+            waiter.send_exception(*sys.exc_info())
+            return
+
+        self.topic_proxy[topic] = eventlet.queue.LightQueue(
+            CONF.rpc_zmq_topic_backlog)
+        self.sockets.append(out_sock)
+
+        # It takes some time for a pub socket to open,
+        # before we can have any faith in doing a send() to it.
+        if sock_type == zmq.PUB:
+            eventlet.sleep(.5)
+
+        waiter.send(True)
+
+        while(True):
+            zmsg = self.topic_proxy[topic].get()
+            out_sock.send(zmsg.raw, copy=False)
+            zmsg.safe_debug(_("ROUTER RELAY-OUT SUCCEEDED %s"))
+
+    def consume(self, sock):
         data = sock.recv(copy=False)
         zmsg = ZmqMsg(data)
         topic = zmsg.topic()
 
-        zmsg.safe_debug(_("CONSUMER GOT %s"))
-
-        if topic.startswith('fanout~'):
-            sock_type = zmq.PUB
-            topic = topic.split('.', 1)[0]
-        elif topic.startswith('zmq_replies'):
+        if topic.startswith('fanout~') or topic.startswith('zmq_replies'):
             sock_type = zmq.PUB
         else:
             sock_type = zmq.PUSH
 
+        zmsg.safe_debug(_("CONSUMER GOT %s"))
         if topic not in self.topic_proxy:
-            def publisher(waiter):
-                LOG.info(_("Creating proxy for topic: %s"), topic)
-
-                try:
-                    # The topic is received over the network,
-                    # don't trust this input.
-                    if self.badchars.search(topic) is not None:
-                        emsg = _("Topic contained dangerous characters.")
-                        LOG.warn(emsg)
-                        raise RPCException(emsg)
-
-                    out_sock = ZmqSocket("ipc://%s/zmq_topic_%s" %
-                                         (ipc_dir, topic),
-                                         sock_type, bind=True)
-                except RPCException:
-                    waiter.send_exception(*sys.exc_info())
-                    return
-
-                self.topic_proxy[topic] = eventlet.queue.LightQueue(
-                    CONF.rpc_zmq_topic_backlog)
-                self.sockets.append(out_sock)
-
-                # It takes some time for a pub socket to open,
-                # before we can have any faith in doing a send() to it.
-                if sock_type == zmq.PUB:
-                    eventlet.sleep(.5)
-
-                waiter.send(True)
-
-                while(True):
-                    zmsg = self.topic_proxy[topic].get()
-                    out_sock.send(zmsg.raw, copy=False)
-                    zmsg.safe_debug(_("ROUTER RELAY-OUT SUCCEEDED %s"))
-
             wait_sock_creation = eventlet.event.Event()
-            eventlet.spawn(publisher, wait_sock_creation)
+            eventlet.spawn(self.publisher, sock_type, topic, wait_sock_creation)
 
             try:
                 wait_sock_creation.wait()
@@ -612,6 +607,8 @@ class ZmqMsg(object):
         return self._ctx, self._envelope
 
     def topic(self):
+        if self._topic.bytes.startswith('fanout~'):
+            return self._topic.bytes.split('.', 1)[0]
         return self._topic.bytes
 
     def context(self):
