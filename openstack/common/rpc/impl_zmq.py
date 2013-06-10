@@ -119,8 +119,8 @@ class ZmqSocket(object):
         self.subscriptions = []
 
         # Support failures on sending/receiving on wrong socket type.
-        self.can_recv = zmq_type in (zmq.PULL, zmq.SUB)
-        self.can_send = zmq_type in (zmq.PUSH, zmq.PUB)
+        self.can_recv = zmq_type in (zmq.PULL, zmq.SUB, zmq.XPUB)
+        self.can_send = zmq_type in (zmq.PUSH, zmq.PUB, zmq.XPUB)
         self.can_sub = zmq_type in (zmq.SUB, )
 
         # Support list, str, & None for subscribe arg (cast to list)
@@ -151,7 +151,7 @@ class ZmqSocket(object):
     def socket_s(self):
         """Get socket type as string."""
         t_enum = ('PUSH', 'PULL', 'PUB', 'SUB', 'REP', 'REQ', 'ROUTER',
-                  'DEALER')
+                  'DEALER', 'XPUB')
         return dict(map(lambda t: (getattr(zmq, t), t), t_enum))[self.type]
 
     def subscribe(self, msg_filter):
@@ -392,7 +392,7 @@ class ZmqBaseReactor(ConsumerBase):
         if not out_addr:
             return
 
-        if zmq_type_out not in (zmq.PUSH, zmq.PUB):
+        if zmq_type_out not in (zmq.PUSH, zmq.XPUB):
             raise RPCException("Bad output socktype")
 
         # Items push out.
@@ -440,6 +440,7 @@ class ZmqProxy(ZmqBaseReactor):
         self.badchars = re.compile(r'[%s]' % re.escape(''.join(pathsep)))
 
         self.topic_proxy = {}
+        self._proxy_create_sem = eventlet.semaphore.Semaphore()
 
     def publisher(self, sock_type, topic, waiter):
         ipc_dir = CONF.rpc_zmq_ipc_dir
@@ -464,12 +465,11 @@ class ZmqProxy(ZmqBaseReactor):
             CONF.rpc_zmq_topic_backlog)
         self.sockets.append(out_sock)
 
-        # It takes some time for a pub socket to open,
-        # before we can have any faith in doing a send() to it.
-        if sock_type == zmq.PUB:
-            eventlet.sleep(.5)
-
         waiter.send(True)
+
+        if sock_type == zmq.XPUB:
+            # Wait for a subscriber before sending first message
+            out_sock.recv()
 
         while(True):
             zmsg = self.topic_proxy[topic].get()
@@ -482,20 +482,21 @@ class ZmqProxy(ZmqBaseReactor):
         topic = zmsg.topic()
 
         if topic.startswith('fanout~') or topic.startswith('zmq_replies'):
-            sock_type = zmq.PUB
+            sock_type = zmq.XPUB
         else:
             sock_type = zmq.PUSH
 
         zmsg.safe_debug(_("CONSUMER GOT %s"))
-        if topic not in self.topic_proxy:
-            wait_sock_creation = eventlet.event.Event()
-            eventlet.spawn(self.publisher, sock_type, topic, wait_sock_creation)
+        with self._proxy_create_sem:
+            if topic not in self.topic_proxy:
+                wait_sock_creation = eventlet.event.Event()
+                eventlet.spawn(self.publisher, sock_type, topic, wait_sock_creation)
 
-            try:
-                wait_sock_creation.wait()
-            except RPCException:
-                LOG.error(_("Topic socket file creation failed."))
-                return
+                try:
+                    wait_sock_creation.wait()
+                except RPCException:
+                    LOG.error(_("Topic socket file creation failed."))
+                    return
 
         try:
             self.topic_proxy[topic].put_nowait(zmsg)
